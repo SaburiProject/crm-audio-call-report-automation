@@ -1,0 +1,769 @@
+/**
+ * CRM Call Report Generator - Google Apps Script
+ * Integrates with FastAPI service to generate call analysis reports
+ */
+
+// === CONFIGURATION ===
+const CONFIG = {
+  // Replace with your actual Cloud Run URL
+  API_BASE_URL: 'https://crm-insights-601356194115.asia-south1.run.app',
+  
+  // Sheet configuration
+  SHEET_NAME: 'CRM_insight_sheet',
+  COLUMNS: {
+    CUSTOMER: 'A',
+    AGENT: 'B', 
+    DATE: 'C',
+    AUDIO: 'D',
+    REPORT: 'E',
+    STATUS: 'F'
+  },
+  
+  // Status values
+  STATUS: {
+    PENDING: 'Pending',
+    PROCESSING: 'Processing...',
+    COMPLETED: 'Completed',
+    ERROR: 'Error'
+  },
+  
+  // PDF configuration
+  PDF: {
+    FOLDER_ID: '1uKV9KMEVnhEUeLaMUmwxphdD3-6HA1DU', // Your specific Google Drive folder ID
+    FOLDER_NAME: 'CRM Call Reports', // Backup folder name if ID fails
+    TEMPLATE_STYLE: `
+      <style>
+        body { font-family: 'Arial', sans-serif; margin: 40px; line-height: 1.6; color: #333; }
+        .header { text-align: center; border-bottom: 3px solid #4285f4; padding-bottom: 20px; margin-bottom: 30px; }
+        .title { color: #4285f4; font-size: 28px; font-weight: bold; margin: 0; }
+        .subtitle { color: #666; font-size: 16px; margin: 10px 0 0 0; }
+        .meta-info { background: #f8f9fa; padding: 20px; border-radius: 8px; margin: 20px 0; }
+        .meta-row { display: flex; margin: 8px 0; }
+        .meta-label { font-weight: bold; color: #4285f4; width: 120px; }
+        .meta-value { color: #333; }
+        .report-content { margin: 30px 0; }
+        .section { margin: 25px 0; }
+        .section h3 { color: #4285f4; border-left: 4px solid #4285f4; padding-left: 15px; margin: 20px 0 10px 0; }
+        .scorecard { background: #e8f0fe; padding: 20px; border-radius: 8px; margin: 20px 0; }
+        .footer { text-align: center; margin-top: 40px; padding-top: 20px; border-top: 1px solid #ddd; color: #666; font-size: 12px; }
+        pre { background: #f8f9fa; padding: 15px; border-radius: 5px; white-space: pre-wrap; word-wrap: break-word; }
+      </style>
+    `
+  }
+};
+
+/**
+ * Get the specific reports folder by ID
+ */
+function getReportsFolder() {
+  try {
+    // Try to get the folder by the specific ID first
+    try {
+      const folder = DriveApp.getFolderById(CONFIG.PDF.FOLDER_ID);
+      console.log(`Using specified folder: ${folder.getName()}`);
+      return folder;
+    } catch (error) {
+      console.log(`Could not access folder with ID ${CONFIG.PDF.FOLDER_ID}: ${error.message}`);
+      
+      // Fallback: Check if folder exists by name
+      const folders = DriveApp.getFoldersByName(CONFIG.PDF.FOLDER_NAME);
+      
+      if (folders.hasNext()) {
+        const folder = folders.next();
+        console.log(`Using fallback folder: ${folder.getName()}`);
+        return folder;
+      }
+      
+      // Last resort: Create new folder
+      const folder = DriveApp.createFolder(CONFIG.PDF.FOLDER_NAME);
+      console.log(`Created new folder: ${CONFIG.PDF.FOLDER_NAME}`);
+      return folder;
+    }
+    
+  } catch (error) {
+    console.error('Error getting reports folder:', error);
+    throw new Error(`Cannot access reports folder: ${error.message}`);
+  }
+}
+
+/**
+ * Format report content into HTML for PDF generation
+ */
+function formatReportAsHTML(reportText, customerName, agentName, date, audioUrl) {
+  const formattedDate = date ? new Date(date).toLocaleDateString() : 'N/A';
+  
+  // Clean and format the report text
+  const cleanReport = reportText
+    .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>') // Bold text
+    .replace(/\*(.*?)\*/g, '<em>$1</em>') // Italic text
+    .replace(/\n\n/g, '</p><p>') // Paragraphs
+    .replace(/\n/g, '<br>') // Line breaks
+    .replace(/(\d+\.\s)/g, '<br><strong>$1</strong>') // Numbered lists
+    .replace(/(Score:|Rating:|Status:)/g, '<strong>$1</strong>'); // Highlight key terms
+  
+  const html = `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <meta charset="UTF-8">
+      ${CONFIG.PDF.TEMPLATE_STYLE}
+    </head>
+    <body>
+      <div class="header">
+        <div class="title">CRM Call Analysis Report</div>
+        <div class="subtitle">Professional Call Evaluation & Insights</div>
+      </div>
+      
+      <div class="meta-info">
+        <div class="meta-row">
+          <span class="meta-label">Customer:</span>
+          <span class="meta-value">${customerName || 'N/A'}</span>
+        </div>
+        <div class="meta-row">
+          <span class="meta-label">Agent:</span>
+          <span class="meta-value">${agentName || 'N/A'}</span>
+        </div>
+        <div class="meta-row">
+          <span class="meta-label">Date:</span>
+          <span class="meta-value">${formattedDate}</span>
+        </div>
+        <div class="meta-row">
+          <span class="meta-label">Report Generated:</span>
+          <span class="meta-value">${new Date().toLocaleString()}</span>
+        </div>
+      </div>
+      
+      <div class="report-content">
+        <p>${cleanReport}</p>
+      </div>
+      
+      <div class="footer">
+        Generated by CRM Call Analysis System<br>
+        Confidential - For Internal Use Only
+      </div>
+    </body>
+    </html>
+  `;
+  
+  return html;
+}
+
+/**
+ * Create PDF from HTML content and save to Google Drive
+ */
+function createPDFReport(reportText, customerName, agentName, date, audioUrl) {
+  try {
+    console.log('Creating PDF report...');
+    
+    // Convert all inputs to strings and handle null/undefined values
+    const safeCustomerName = String(customerName || 'Unknown').trim();
+    const safeAgentName = String(agentName || 'Unknown').trim();
+    const safeDate = date ? new Date(date).toLocaleDateString() : 'N/A';
+    
+    console.log(`PDF inputs - Customer: ${safeCustomerName}, Agent: ${safeAgentName}, Date: ${safeDate}`);
+    
+    // Create a temporary Google Doc
+    const tempDocName = `temp_report_${Date.now()}`;
+    const doc = DocumentApp.create(tempDocName);
+    const body = doc.getBody();
+    
+    // Clear the document and add formatted content
+    body.clear();
+    
+    // Add title
+    const title = body.appendParagraph('CRM CALL ANALYSIS REPORT');
+    title.setHeading(DocumentApp.ParagraphHeading.TITLE);
+    title.setAlignment(DocumentApp.HorizontalAlignment.CENTER);
+    
+    // Add spacing
+    body.appendParagraph('');
+    
+    // Add metadata table
+    const metaTable = body.appendTable();
+    
+    // Add table rows properly
+    const customerRow = metaTable.appendTableRow();
+    customerRow.appendTableCell('Customer:');
+    customerRow.appendTableCell(safeCustomerName);
+    
+    const agentRow = metaTable.appendTableRow();
+    agentRow.appendTableCell('Agent:');
+    agentRow.appendTableCell(safeAgentName);
+    
+    const dateRow = metaTable.appendTableRow();
+    dateRow.appendTableCell('Date:');
+    dateRow.appendTableCell(safeDate);
+    
+    const generatedRow = metaTable.appendTableRow();
+    generatedRow.appendTableCell('Report Generated:');
+    generatedRow.appendTableCell(new Date().toLocaleString());
+    
+    // Style the table
+    const tableStyle = {};
+    tableStyle[DocumentApp.Attribute.BORDER_WIDTH] = 1;
+    tableStyle[DocumentApp.Attribute.BORDER_COLOR] = '#cccccc';
+    metaTable.setAttributes(tableStyle);
+    
+    // Add spacing
+    body.appendParagraph('');
+    body.appendParagraph('');
+    
+    // Add report content
+    const reportHeading = body.appendParagraph('CALL ANALYSIS REPORT');
+    reportHeading.setHeading(DocumentApp.ParagraphHeading.HEADING1);
+    
+    // Clean and add the report text
+    const cleanReport = String(reportText || 'No report content available')
+      .replace(/\*\*(.*?)\*\*/g, '$1') // Remove markdown bold
+      .replace(/\*(.*?)\*/g, '$1') // Remove markdown italic
+      .replace(/[\u2018\u2019]/g, "'") // Replace smart quotes
+      .replace(/[\u201C\u201D]/g, '"'); // Replace smart quotes
+    
+    // Split report into paragraphs and add them
+    const paragraphs = cleanReport.split('\n\n');
+    for (let i = 0; i < paragraphs.length; i++) {
+      if (paragraphs[i].trim()) {
+        const para = body.appendParagraph(paragraphs[i].trim());
+        
+        // Make section headers bold
+        if (paragraphs[i].includes(':') && paragraphs[i].length < 100) {
+          para.setBold(true);
+        }
+      }
+    }
+    
+    // Add footer
+    body.appendParagraph('');
+    const footer = body.appendParagraph('Generated by CRM Call Analysis System - Confidential');
+    footer.setAlignment(DocumentApp.HorizontalAlignment.CENTER);
+    footer.setItalic(true);
+    footer.setFontSize(10);
+    
+    // Save and close the document
+    doc.saveAndClose();
+    
+    console.log('Document created, converting to PDF...');
+    
+    // Convert to PDF
+    const docFile = DriveApp.getFileById(doc.getId());
+    const pdfBlob = docFile.getAs('application/pdf');
+    
+    // Create filename with safe string handling
+    const timestamp = new Date().toISOString().slice(0, 19).replace(/[:-]/g, '');
+    const cleanCustomerName = safeCustomerName.replace(/[^a-zA-Z0-9\s]/g, '_').replace(/\s+/g, '_');
+    const filename = `CRM_Report_${cleanCustomerName}_${timestamp}.pdf`;
+    
+    console.log(`Saving PDF with filename: ${filename}`);
+    
+    // Save PDF to reports folder
+    const folder = getReportsFolder();
+    const pdfFile = folder.createFile(pdfBlob.setName(filename));
+    
+    // Make the PDF shareable (anyone with link can view)
+    pdfFile.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+    
+    console.log('PDF saved, cleaning up temporary document...');
+    
+    // Delete the temporary document
+    DriveApp.getFileById(doc.getId()).setTrashed(true);
+    
+    // Return the PDF file URL
+    const pdfUrl = pdfFile.getUrl();
+    console.log(`✅ PDF created successfully: ${filename}`);
+    
+    return {
+      url: pdfUrl,
+      filename: filename,
+      fileId: pdfFile.getId()
+    };
+    
+  } catch (error) {
+    console.error('❌ Error creating PDF report:', error);
+    console.error('❌ Error stack:', error.stack);
+    throw new Error(`PDF creation failed: ${error.message}`);
+  }
+}
+function extractDriveFileId(url) {
+  if (!url) return null;
+  
+  const patterns = [
+    /\/file\/d\/([a-zA-Z0-9-_]+)/,
+    /id=([a-zA-Z0-9-_]+)/,
+    /\/d\/([a-zA-Z0-9-_]+)/
+  ];
+  
+  for (const pattern of patterns) {
+    const match = url.match(pattern);
+    if (match) return match[1];
+  }
+  
+  return null;
+}
+
+/**
+ * Call the FastAPI service to generate a report
+ */
+function callReportAPI(fileId) {
+  try {
+    const payload = {
+      file_id: fileId
+    };
+    
+    const options = {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      payload: JSON.stringify(payload),
+      muteHttpExceptions: true
+    };
+    
+    console.log(`Calling API with file ID: ${fileId}`);
+    const response = UrlFetchApp.fetch(`${CONFIG.API_BASE_URL}/generate-report`, options);
+    
+    console.log(`API Response Code: ${response.getResponseCode()}`);
+    console.log(`API Response: ${response.getContentText()}`);
+    
+    if (response.getResponseCode() !== 200) {
+      const errorText = response.getContentText();
+      console.error(`API Error: ${response.getResponseCode()} - ${errorText}`);
+      throw new Error(`API returned ${response.getResponseCode()}: ${errorText}`);
+    }
+    
+    const result = JSON.parse(response.getContentText());
+    return result.report;
+    
+  } catch (error) {
+    console.error('API call failed:', error);
+    throw error;
+  }
+}
+
+/**
+ * Process a single row to generate report
+ */
+function processRow(sheet, rowIndex) {
+  const row = rowIndex;
+  
+  try {
+    console.log(`=== PROCESSING ROW ${row} ===`);
+    
+    // Get row data
+    const customerName = sheet.getRange(row, 1).getValue();
+    const agentName = sheet.getRange(row, 2).getValue();
+    const date = sheet.getRange(row, 3).getValue();
+    const audioUrl = sheet.getRange(row, 4).getValue();
+    
+    console.log(`Row ${row} data: Customer=${customerName}, Agent=${agentName}, Date=${date}`);
+    console.log(`Row ${row} audio URL: ${audioUrl}`);
+    
+    if (!audioUrl) {
+      console.log(`Row ${row}: No audio URL found`);
+      sheet.getRange(row, 6).setValue('No audio URL');
+      return false;
+    }
+    
+    // Extract file ID from Google Drive URL
+    const fileId = extractDriveFileId(audioUrl);
+    console.log(`Row ${row}: Extracted file ID: ${fileId}`);
+    
+    if (!fileId) {
+      sheet.getRange(row, 6).setValue('Invalid Drive URL');
+      console.log(`Row ${row}: Could not extract file ID from URL`);
+      return false;
+    }
+    
+    // Update status to processing
+    sheet.getRange(row, 6).setValue(CONFIG.STATUS.PROCESSING);
+    SpreadsheetApp.flush();
+    
+    console.log(`Row ${row}: Starting API call for file ID ${fileId}`);
+    
+    // Call API to generate report
+    const reportText = callReportAPI(fileId);
+    console.log(`Row ${row}: API call successful, report length: ${reportText.length}`);
+    
+    // Create PDF report
+    console.log(`Row ${row}: Creating PDF report...`);
+    const pdfInfo = createPDFReport(reportText, customerName, agentName, date, audioUrl);
+    console.log(`Row ${row}: PDF created: ${pdfInfo.filename}`);
+    
+    // Update the sheet with PDF link instead of raw text
+    const pdfLink = `=HYPERLINK("${pdfInfo.url}", "📄 ${pdfInfo.filename}")`;
+    sheet.getRange(row, 5).setValue(pdfLink); // Column E (Report) - now contains PDF link
+    sheet.getRange(row, 6).setValue(CONFIG.STATUS.COMPLETED); // Column F (Status)
+    
+    console.log(`Row ${row}: ✅ PDF report created successfully - ${pdfInfo.filename}`);
+    return true;
+    
+  } catch (error) {
+    console.error(`Row ${row}: ❌ Error during processing:`, error);
+    console.error(`Row ${row}: Error message: ${error.message}`);
+    console.error(`Row ${row}: Error stack:`, error.stack);
+    
+    // Determine more specific error message
+    let errorMsg = error.message;
+    if (error.message.includes('File not found')) {
+      errorMsg = 'Audio file not accessible';
+    } else if (error.message.includes('API returned')) {
+      errorMsg = 'API processing failed';
+    } else if (error.message.includes('folder')) {
+      errorMsg = 'Cannot save PDF to folder';
+    } else if (error.message.includes('Permission')) {
+      errorMsg = 'Permission denied';
+    }
+    
+    sheet.getRange(row, 6).setValue(`Error: ${errorMsg}`);
+    return false;
+  }
+}
+
+/**
+ * Process all pending rows in the sheet
+ */
+function processAllPendingReports() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(CONFIG.SHEET_NAME);
+  
+  if (!sheet) {
+    throw new Error(`Sheet "${CONFIG.SHEET_NAME}" not found`);
+  }
+  
+  const lastRow = sheet.getLastRow();
+  let processedCount = 0;
+  let errorCount = 0;
+  
+  console.log(`Processing rows from 2 to ${lastRow}`);
+  
+  // Process each row (starting from row 2, skipping header)
+  for (let row = 2; row <= lastRow; row++) {
+    const currentStatus = sheet.getRange(row, 6).getValue();
+    const audioUrl = sheet.getRange(row, 4).getValue();
+    
+    // Skip if no audio URL or already processed
+    if (!audioUrl || 
+        currentStatus === CONFIG.STATUS.COMPLETED || 
+        currentStatus === CONFIG.STATUS.PROCESSING) {
+      continue;
+    }
+    
+    console.log(`Processing row ${row}`);
+    
+    if (processRow(sheet, row)) {
+      processedCount++;
+    } else {
+      errorCount++;
+    }
+    
+    // Add a small delay to avoid overwhelming the API
+    Utilities.sleep(1000);
+  }
+  
+  // Show completion message
+  const message = `Processing complete!\nSuccessful: ${processedCount}\nErrors: ${errorCount}`;
+  console.log(message);
+  SpreadsheetApp.getUi().alert('Report Generation Complete', message, SpreadsheetApp.getUi().ButtonSet.OK);
+}
+
+/**
+ * Process only the selected row
+ */
+function processSelectedRow() {
+  const sheet = SpreadsheetApp.getActiveSheet();
+  const activeRange = sheet.getActiveRange();
+  const row = activeRange.getRow();
+  
+  if (row < 2) {
+    SpreadsheetApp.getUi().alert('Invalid Selection', 'Please select a data row (not the header)', SpreadsheetApp.getUi().ButtonSet.OK);
+    return;
+  }
+  
+  console.log(`Processing selected row: ${row}`);
+  
+  if (processRow(sheet, row)) {
+    SpreadsheetApp.getUi().alert('Success', `Report generated for row ${row}`, SpreadsheetApp.getUi().ButtonSet.OK);
+  } else {
+    SpreadsheetApp.getUi().alert('Error', `Failed to generate report for row ${row}. Check the logs for details.`, SpreadsheetApp.getUi().ButtonSet.OK);
+  }
+}
+
+/**
+ * Clear all reports and reset status
+ */
+function clearAllReports() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(CONFIG.SHEET_NAME);
+  
+  if (!sheet) {
+    throw new Error(`Sheet "${CONFIG.SHEET_NAME}" not found`);
+  }
+  
+  const ui = SpreadsheetApp.getUi();
+  const response = ui.alert('Clear All Reports', 
+    'Are you sure you want to clear all reports and reset status?\n\n⚠️ This will also delete all PDF files from Google Drive!\n\nThis action cannot be undone.', 
+    ui.ButtonSet.YES_NO);
+  
+  if (response === ui.Button.YES) {
+    const lastRow = sheet.getLastRow();
+    
+    if (lastRow > 1) {
+      try {
+        // Get all the PDF links before clearing
+        const reportRange = sheet.getRange(2, 5, lastRow - 1, 1);
+        const reportValues = reportRange.getValues();
+        
+        // Delete PDF files from Drive
+        let deletedCount = 0;
+        for (let i = 0; i < reportValues.length; i++) {
+          const cellValue = reportValues[i][0];
+          if (cellValue && typeof cellValue === 'string' && cellValue.includes('HYPERLINK')) {
+            try {
+              // Extract URL from HYPERLINK formula
+              const urlMatch = cellValue.match(/HYPERLINK\("([^"]+)"/);
+              if (urlMatch) {
+                const fileId = extractDriveFileId(urlMatch[1]);
+                if (fileId) {
+                  DriveApp.getFileById(fileId).setTrashed(true);
+                  deletedCount++;
+                }
+              }
+            } catch (e) {
+              console.log(`Could not delete PDF for row ${i + 2}: ${e.message}`);
+            }
+          }
+        }
+        
+        // Clear Report column (E) and Status column (F)
+        sheet.getRange(2, 5, lastRow - 1, 2).clearContent();
+        
+        console.log(`Cleared all reports and deleted ${deletedCount} PDF files`);
+        ui.alert('Success', `All reports cleared and ${deletedCount} PDF files deleted from Drive.`, ui.ButtonSet.OK);
+        
+      } catch (error) {
+        console.error('Error during cleanup:', error);
+        ui.alert('Partial Success', 'Reports cleared from sheet, but some PDF files may not have been deleted. Check the logs for details.', ui.ButtonSet.OK);
+      }
+    }
+  }
+}
+
+/**
+ * Open the specific PDF reports folder in Google Drive
+ */
+function openReportsFolder() {
+  try {
+    const folder = getReportsFolder();
+    const folderUrl = folder.getUrl();
+    const folderName = folder.getName();
+    
+    // Show the folder URL to user
+    const ui = SpreadsheetApp.getUi();
+    ui.alert('Reports Folder', 
+      `PDF reports are saved in the "${folderName}" folder.\n\nFolder URL: ${folderUrl}\n\nClick OK and then manually open this URL in your browser.`, 
+      ui.ButtonSet.OK);
+    
+    console.log(`Reports folder: ${folderName}`);
+    console.log(`Reports folder URL: ${folderUrl}`);
+    
+  } catch (error) {
+    console.error('Error opening reports folder:', error);
+    SpreadsheetApp.getUi().alert('Error', `Could not open reports folder: ${error.message}`, SpreadsheetApp.getUi().ButtonSet.OK);
+  }
+}
+
+/**
+ * Test folder access
+ */
+function testFolderAccess() {
+  try {
+    const folder = getReportsFolder();
+    const folderName = folder.getName();
+    const folderUrl = folder.getUrl();
+    
+    SpreadsheetApp.getUi().alert('Folder Access Test', 
+      `✅ Successfully accessed folder!\n\nFolder Name: ${folderName}\nFolder ID: ${CONFIG.PDF.FOLDER_ID}\nFolder URL: ${folderUrl}`, 
+      SpreadsheetApp.getUi().ButtonSet.OK);
+    
+    console.log(`✅ Folder access test successful: ${folderName}`);
+    
+  } catch (error) {
+    console.error('❌ Folder access test failed:', error);
+    SpreadsheetApp.getUi().alert('Folder Access Test Failed', 
+      `❌ Cannot access the specified folder.\n\nError: ${error.message}\n\nPlease check:\n1. Folder ID is correct\n2. You have access to the folder\n3. Folder exists`, 
+      SpreadsheetApp.getUi().ButtonSet.OK);
+  }
+}
+
+/**
+ * Test API connection
+ */
+function testAPIConnection() {
+  try {
+    // Just test if the API endpoint is reachable
+    const response = UrlFetchApp.fetch(`${CONFIG.API_BASE_URL}/generate-report`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      payload: JSON.stringify({file_id: 'test'}),
+      muteHttpExceptions: true
+    });
+    
+    console.log(`API Response Code: ${response.getResponseCode()}`);
+    console.log(`API Response: ${response.getContentText()}`);
+    
+    if (response.getResponseCode() === 400 || response.getResponseCode() === 500) {
+      SpreadsheetApp.getUi().alert('API Connection Test', 
+        'API is reachable! Ready to test with real data.', 
+        SpreadsheetApp.getUi().ButtonSet.OK);
+    } else {
+      SpreadsheetApp.getUi().alert('API Connection Test', 
+        `Unexpected response code: ${response.getResponseCode()}`, 
+        SpreadsheetApp.getUi().ButtonSet.OK);
+    }
+    
+  } catch (error) {
+    console.error('API connection test failed:', error);
+    SpreadsheetApp.getUi().alert('API Connection Test Failed', 
+      `Cannot reach API: ${error.message}`, 
+      SpreadsheetApp.getUi().ButtonSet.OK);
+  }
+}
+
+/**
+ * Create custom menu in Google Sheets
+ */
+function onOpen() {
+  const ui = SpreadsheetApp.getUi();
+  ui.createMenu('CRM Report Generator')
+    .addItem('📊 Process All Pending Reports', 'processAllPendingReports')
+    .addItem('🔄 Process Selected Row', 'processSelectedRow')
+    .addSeparator()
+    .addItem('🧪 Test API Connection', 'testAPIConnection')
+    .addItem('🎯 Test with Real File', 'testWithRealFile')
+    .addItem('🐛 Debug Row Processing', 'debugRowProcessing')
+    .addItem('📁 Test Folder Access', 'testFolderAccess')
+    .addSeparator()
+    .addItem('📁 Open Reports Folder', 'openReportsFolder')
+    .addItem('🗑️ Clear All Reports', 'clearAllReports')
+    .addToUi();
+}
+
+/**
+ * Setup function - run this once to initialize
+ */
+function setup() {
+  console.log('Setting up CRM Report Generator...');
+  
+  // Create the menu
+  onOpen();
+  
+  console.log('Setup complete! Update the API_BASE_URL in CONFIG and share Drive files with your service account.');
+  
+  SpreadsheetApp.getUi().alert('Setup Complete', 
+    'Remember to:\n1. Update API_BASE_URL in the script\n2. Share your Drive files with the service account\n3. Test with "Test with Real File"', 
+    SpreadsheetApp.getUi().ButtonSet.OK);
+}
+
+/**
+ * Detailed debug function for troubleshooting
+ */
+function debugRowProcessing() {
+  const sheet = SpreadsheetApp.getActiveSheet();
+  const activeRange = sheet.getActiveRange();
+  const row = activeRange.getRow();
+  
+  if (row < 2) {
+    SpreadsheetApp.getUi().alert('Debug Error', 'Please select a data row (not the header)', SpreadsheetApp.getUi().ButtonSet.OK);
+    return;
+  }
+  
+  console.log(`=== DEBUGGING ROW ${row} ===`);
+  
+  try {
+    // Step 1: Get all row data
+    const customerName = sheet.getRange(row, 1).getValue();
+    const agentName = sheet.getRange(row, 2).getValue();
+    const date = sheet.getRange(row, 3).getValue();
+    const audioUrl = sheet.getRange(row, 4).getValue();
+    
+    console.log(`Step 1 - Row Data:`);
+    console.log(`  Customer: ${customerName}`);
+    console.log(`  Agent: ${agentName}`);
+    console.log(`  Date: ${date}`);
+    console.log(`  Audio URL: ${audioUrl}`);
+    
+    if (!audioUrl) {
+      throw new Error('No audio URL found in column D');
+    }
+    
+    // Step 2: Extract file ID
+    const fileId = extractDriveFileId(audioUrl);
+    console.log(`Step 2 - File ID extraction:`);
+    console.log(`  Extracted File ID: ${fileId}`);
+    
+    if (!fileId) {
+      throw new Error('Could not extract file ID from URL');
+    }
+    
+    // Step 3: Test API call
+    console.log(`Step 3 - Testing API call...`);
+    const reportText = callReportAPI(fileId);
+    console.log(`Step 3 - API call successful!`);
+    console.log(`  Report length: ${reportText.length} characters`);
+    console.log(`  Report preview: ${reportText.substring(0, 200)}...`);
+    
+    // Step 4: Test folder access
+    console.log(`Step 4 - Testing folder access...`);
+    const folder = getReportsFolder();
+    console.log(`Step 4 - Folder access successful!`);
+    console.log(`  Folder name: ${folder.getName()}`);
+    console.log(`  Folder ID: ${folder.getId()}`);
+    
+    // Step 5: Test PDF creation
+    console.log(`Step 5 - Testing PDF creation...`);
+    const pdfInfo = createPDFReport(reportText, customerName, agentName, date, audioUrl);
+    console.log(`Step 5 - PDF creation successful!`);
+    console.log(`  PDF filename: ${pdfInfo.filename}`);
+    console.log(`  PDF URL: ${pdfInfo.url}`);
+    
+    SpreadsheetApp.getUi().alert('Debug Success!', 
+      `✅ All steps completed successfully!\n\nPDF created: ${pdfInfo.filename}\n\nCheck the logs for detailed information.`, 
+      SpreadsheetApp.getUi().ButtonSet.OK);
+    
+  } catch (error) {
+    console.error(`❌ Debug failed at step: ${error.message}`);
+    console.error(`❌ Full error:`, error);
+    
+    SpreadsheetApp.getUi().alert('Debug Failed', 
+      `❌ Error: ${error.message}\n\nCheck the Apps Script logs for detailed information:\n1. Go to Apps Script\n2. Click "Executions" in left sidebar\n3. Look for recent failed execution`, 
+      SpreadsheetApp.getUi().ButtonSet.OK);
+  }
+}
+function testWithRealFile() {
+  const sheet = SpreadsheetApp.getActiveSheet();
+  const audioUrl = sheet.getRange(2, 4).getValue(); // Get URL from D2
+  
+  if (!audioUrl) {
+    SpreadsheetApp.getUi().alert('Test Error', 'No audio URL found in cell D2. Please add a Google Drive URL there first.', SpreadsheetApp.getUi().ButtonSet.OK);
+    return;
+  }
+  
+  console.log('Audio URL:', audioUrl);
+  
+  const fileId = extractDriveFileId(audioUrl);
+  console.log('Extracted File ID:', fileId);
+  
+  if (!fileId) {
+    SpreadsheetApp.getUi().alert('Test Error', 'Could not extract file ID from URL. Please check the URL format.', SpreadsheetApp.getUi().ButtonSet.OK);
+    return;
+  }
+  
+  SpreadsheetApp.getUi().alert('Test Info', `Testing with File ID: ${fileId}\nThis will take a moment...`, SpreadsheetApp.getUi().ButtonSet.OK);
+  
+  try {
+    const report = callReportAPI(fileId);
+    console.log('✅ Report generated successfully');
+    console.log('Report preview:', report.substring(0, 500) + '...');
+    SpreadsheetApp.getUi().alert('Test Success!', 'Report generated successfully! Check the logs for details.', SpreadsheetApp.getUi().ButtonSet.OK);
+  } catch (error) {
+    console.error('❌ Test failed:', error);
+    SpreadsheetApp.getUi().alert('Test Failed', `Error: ${error.message}`, SpreadsheetApp.getUi().ButtonSet.OK);
+  }
+}
