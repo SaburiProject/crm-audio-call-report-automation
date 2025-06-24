@@ -6,7 +6,7 @@
 // === CONFIGURATION ===
 const CONFIG = {
   // Replace with your actual Cloud Run URL
-  API_BASE_URL: 'https://crm-insights-601356194115.asia-south1.run.app',
+  API_BASE_URL: 'https://endpoint.app',
   
   // Sheet configuration
   SHEET_NAME: 'CRM_insight_sheet',
